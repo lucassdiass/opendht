@@ -4,6 +4,9 @@
     <a id="user-content-opendht-" class="anchor" href="/savoirfairelinux/opendht/blob/master/README.md#opendht-" aria-hidden="true"></a>OpenDHT
 </h1>
 
+OpenDHTpki is based on OpenDHT. It adds digital signature and digital certificate verification in
+find node and messages. The paper "Inserção de Infraestrutura de Chave Pública no Projeto OpenDHT"
+describes better (https://sol.sbc.org.br/index.php/sbseg/article/view/17329).
 A lightweight C++17 Distributed Hash Table implementation.
 
 OpenDHT provides an easy to use distributed in-memory data store.
