@@ -20,6 +20,7 @@
 #include "infohash.h"
 #include "sockaddr.h"
 #include "net.h"
+#include <PKIpp/PKIconverter.hpp>
 
 #include <map>
 #include <string_view>
@@ -40,6 +41,9 @@ static constexpr auto KEY_NETID = "n"sv;
 static constexpr auto KEY_ISCLIENT = "s"sv;
 static constexpr auto KEY_Q = "q"sv;
 static constexpr auto KEY_A = "a"sv;
+static constexpr auto KEY_AUTH = "A"sv;
+static constexpr auto KEY_CERT = "C"sv;
+static constexpr auto KEY_ADDR = "I"sv;
 
 static constexpr auto KEY_REQ_SID = "sid"sv;
 static constexpr auto KEY_REQ_ID = "id"sv;
@@ -77,6 +81,7 @@ Tid unpackTid(const msgpack::object& o) {
 }
 
 struct ParsedMessage {
+    bool is_verified{false};
     MessageType type;
     /* Node ID of the sender */
     InfoHash id;
@@ -121,9 +126,20 @@ struct ParsedMessage {
     int version {0};
     SockAddr addr;
     void msgpack_unpack(const msgpack::object& o);
-
+    void verify_ping();
+    void verify_reply_ping();
+    void verify_reply_announce_value();
+    void verify_listen();
+    void verify_reply_listen();
+    void verify_refresh();
+    void verify_reply_refresh();
+    void verify_find_node();
+    void verify_reply_find_node();
     bool append(const ParsedMessage& block);
     bool complete();
+    std::string signature{};
+    std::string certificate{};
+    std::string address{};
 };
 
 bool
@@ -206,6 +222,12 @@ ParsedMessage::msgpack_unpack(const msgpack::object& msg)
             parsed.q = o.val.as<std::string_view>();
         else if (key == KEY_A)
             parsed.a = &o.val;
+        else if (key == KEY_AUTH)
+            signature= o.val.as<std::string>();
+        else if (key==KEY_ADDR)
+            address = o.val.as<std::string>();
+        else if(key == KEY_CERT)
+            certificate=o.val.as<std::string>();
     }
 
     if (parsed.e)
@@ -379,6 +401,333 @@ ParsedMessage::msgpack_unpack(const msgpack::object& msg)
         }
     } else {
         want = -1;
+    }
+}
+
+void
+ParsedMessage::verify_ping()
+{
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+
+    pk.pack_map(8+(network>0?1:0));
+    pk.pack(KEY_A); pk.pack_map(1);
+    pk.pack(KEY_REQ_ID); pk.pack(id);
+    pk.pack(KEY_Q); pk.pack(QUERY_PING);
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_Q);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network>0)
+    {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    pk.pack(KEY_ADDR); pk.pack(address);
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+
+void
+ParsedMessage::verify_reply_ping()
+{
+
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(6+(network?1:0));
+    pk.pack(KEY_R); pk.pack_map(2);
+    pk.pack(KEY_REQ_ID); pk.pack(id);
+    size_t addr_len = std::min<size_t>(addr.getLength(),
+            (addr.getFamily() == AF_INET) ? sizeof(in_addr) : sizeof(in6_addr));
+    void* addr_ptr = (addr.getFamily() == AF_INET) ? (void*)&addr.getIPv4().sin_addr
+            : (void*)&addr.getIPv6().sin6_addr;
+    pk.pack("sa");
+    pk.pack_bin(addr_len);
+    pk.pack_bin_body((char*)addr_ptr, addr_len);
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_R);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+
+void
+ParsedMessage::verify_reply_announce_value()
+{
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(5+(network?1:0));
+    pk.pack(KEY_R); pk.pack_map(3);
+    pk.pack(KEY_REQ_ID);  pk.pack(id);
+    pk.pack(KEY_REQ_VALUE_ID); pk.pack(value_id);
+    size_t addr_len = std::min<size_t>(addr.getLength(),
+            (addr.getFamily() == AF_INET) ? sizeof(in_addr) : sizeof(in6_addr));
+    void* addr_ptr = (addr.getFamily() == AF_INET) ? (void*)&addr.getIPv4().sin_addr
+            : (void*)&addr.getIPv6().sin6_addr;
+    pk.pack("sa");
+    pk.pack_bin(addr_len);
+    pk.pack_bin_body((char*)addr_ptr, addr_len);
+
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_R);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+void
+ParsedMessage::verify_listen()
+{
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(6+(network?1:0));
+    auto has_query = not query.where.empty() or not query.select.empty();
+    pk.pack(KEY_A); pk.pack_map(5 + has_query);
+    pk.pack(KEY_REQ_ID);    pk.pack(id);
+    pk.pack(KEY_VERSION);   pk.pack(1);
+    pk.pack(KEY_REQ_H);     pk.pack(this->info_hash);
+    pk.pack(KEY_REQ_TOKEN);
+    pk.pack_bin(token.size());
+    pk.pack_bin_body((char*)token.data(), token.size());
+
+    pk.pack(KEY_REQ_SID);   pk.pack(socket_id);
+    if (has_query) {
+        pk.pack(KEY_REQ_QUERY); pk.pack(query);
+    }
+    pk.pack(KEY_Q); pk.pack(QUERY_LISTEN);
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_Q);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+
+void
+ParsedMessage::verify_reply_listen()
+{
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(5+(network?1:0));
+    pk.pack(KEY_R); pk.pack_map(2);
+    pk.pack(KEY_REQ_ID); pk.pack(id);
+    size_t addr_len = std::min<size_t>(addr.getLength(),
+            (addr.getFamily() == AF_INET) ? sizeof(in_addr) : sizeof(in6_addr));
+    void* addr_ptr = (addr.getFamily() == AF_INET) ? (void*)&addr.getIPv4().sin_addr
+            : (void*)&addr.getIPv6().sin6_addr;
+    pk.pack("sa");
+    pk.pack_bin(addr_len);
+    pk.pack_bin_body((char*)addr_ptr, addr_len);
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_R);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+
+void
+ParsedMessage::verify_refresh()
+{
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(6+(network?1:0));
+    pk.pack(KEY_A); pk.pack_map(4);
+    pk.pack(KEY_REQ_ID);       pk.pack(id);
+    pk.pack(KEY_REQ_H);        pk.pack(info_hash);
+    pk.pack(KEY_REQ_VALUE_ID); pk.pack(value_id);
+    pk.pack(KEY_REQ_TOKEN);    pk.pack(token);
+    pk.pack(KEY_Q); pk.pack(QUERY_REFRESH);
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_Q);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+void
+ParsedMessage::verify_reply_refresh()
+{
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(5+(network?1:0));
+    pk.pack(KEY_R); pk.pack_map(3);
+    pk.pack(KEY_REQ_ID);  pk.pack(id);
+    pk.pack(KEY_REQ_VALUE_ID); pk.pack(value_id);
+    size_t addr_len = std::min<size_t>(addr.getLength(),
+            (addr.getFamily() == AF_INET) ? sizeof(in_addr) : sizeof(in6_addr));
+    void* addr_ptr = (addr.getFamily() == AF_INET) ? (void*)&addr.getIPv4().sin_addr
+            : (void*)&addr.getIPv6().sin6_addr;
+    pk.pack("sa");
+    pk.pack_bin(addr_len);
+    pk.pack_bin_body((char*)addr_ptr, addr_len);
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_R);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+void
+ParsedMessage::verify_find_node()
+{
+
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(6+(network?1:0));
+
+    pk.pack(KEY_A); pk.pack_map(2 + (want>0?1:0));
+    pk.pack(KEY_REQ_ID);     pk.pack(id);
+    pk.pack(KEY_REQ_TARGET); pk.pack(target);
+    if (want > 0) {
+        pk.pack(KEY_REQ_WANT);
+        pk.pack_array(((want & WANT4)?1:0) + ((want & WANT6)?1:0));
+        if (want & WANT4) pk.pack(AF_INET);
+        if (want & WANT6) pk.pack(AF_INET6);
+    }
+
+    pk.pack(KEY_Q); pk.pack(QUERY_FIND);
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_Q);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
+    }
+}
+
+void
+ParsedMessage::verify_reply_find_node()
+{
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> pk(&buffer);
+    pk.pack_map(5+(network?1:0));
+    pk.pack(KEY_R);
+    pk.pack_map(2 + (nodes4_raw.size()>0?1:0) + (nodes6_raw.size()>0?1:0) + (not token.empty()?1:0) );
+    pk.pack(KEY_REQ_ID); pk.pack(id);
+    size_t addr_len = std::min<size_t>(addr.getLength(),
+            (addr.getFamily() == AF_INET) ? sizeof(in_addr) : sizeof(in6_addr));
+    void* addr_ptr = (addr.getFamily() == AF_INET) ? (void*)&addr.getIPv4().sin_addr
+            : (void*)&addr.getIPv6().sin6_addr;
+    pk.pack("sa");
+    pk.pack_bin(addr_len);
+    pk.pack_bin_body((char*)addr_ptr, addr_len);
+    if(nodes4_raw.size())
+    {
+        pk.pack(KEY_REQ_NODES4);
+        pk.pack_bin(nodes4_raw.size());
+        pk.pack_bin_body((const char*)nodes4_raw.data(), nodes4_raw.size());
+    }
+    if(nodes6_raw.size())
+    {
+        pk.pack(KEY_REQ_NODES6);
+        pk.pack_bin(nodes6_raw.size());
+        pk.pack_bin_body((const char*)nodes6_raw.data(), nodes6_raw.size());
+    }
+    if (not token.empty()) {
+        pk.pack(KEY_REQ_TOKEN); pk.pack_bin(token.size());
+        pk.pack_bin_body((char*)token.data(), token.size());
+    }
+    pk.pack(KEY_TID); pk.pack(tid);
+    pk.pack(KEY_Y); pk.pack(KEY_R);
+    pk.pack(KEY_UA); pk.pack(ua);
+    if (network) {
+        pk.pack(KEY_NETID); pk.pack(network);
+    }
+    try
+    {
+        PKI::Converter::Base64 encoder;
+        std::unique_ptr<PKI::PKICertificate>cert{new PKI::PKICertificate{certificate,"",false}};
+        std::string aux{buffer.data(),buffer.size()};
+        is_verified=cert!=nullptr&&cert->VerifySignatureMessage(encoder.Encoder(aux), signature);
+    }
+    catch(...)
+    {
+        is_verified=false;
     }
 }
 

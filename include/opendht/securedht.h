@@ -42,6 +42,10 @@ public:
         auto c = conf.node_config;
         if (not c.node_id and conf.id.second)
             c.node_id = InfoHash::get("node:"+conf.id.second->getId().toString());
+        c.certpath=conf.node_config.certpath;
+        c.prvpath=conf.node_config.prvpath;
+        c.crlpath=conf.node_config.crlpath;
+        c.capath=conf.node_config.capath;
         return c;
     }
 

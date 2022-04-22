@@ -22,7 +22,7 @@
 #include "default_types.h"
 #include "log_enable.h"
 #include "parsed_message.h"
-
+#include <PKIpp/PKIconverter.hpp>
 #include <msgpack.hpp>
 
 namespace dht {
@@ -73,14 +73,16 @@ packToken(msgpack::packer<msgpack::sbuffer>& pk, const Blob& token)
 }
 
 RequestAnswer::RequestAnswer(ParsedMessage&& msg)
- : ntoken(std::move(msg.token)),
-   values(std::move(msg.values)),
-   refreshed_values(std::move(msg.refreshed_values)),
-   expired_values(std::move(msg.expired_values)),
-   fields(std::move(msg.fields)),
-   nodes4(std::move(msg.nodes4)),
-   nodes6(std::move(msg.nodes6))
-{}
+: ntoken(std::move(msg.token)),
+  values(std::move(msg.values)),
+  refreshed_values(std::move(msg.refreshed_values)),
+  expired_values(std::move(msg.expired_values)),
+  fields(std::move(msg.fields)),
+  nodes4(std::move(msg.nodes4)),
+  nodes6(std::move(msg.nodes6))
+{
+}
+
 
 NetworkEngine::NetworkEngine(InfoHash& myid, NetworkConfig c,
         std::unique_ptr<DatagramSocket>&& sock,
@@ -95,7 +97,11 @@ NetworkEngine::NetworkEngine(InfoHash& myid, NetworkConfig c,
         decltype(NetworkEngine::onGetValues)&& onGetValues,
         decltype(NetworkEngine::onListen)&& onListen,
         decltype(NetworkEngine::onAnnounce)&& onAnnounce,
-        decltype(NetworkEngine::onRefresh)&& onRefresh) :
+        decltype(NetworkEngine::onRefresh)&& onRefresh,
+        std::string certpath="",
+        std::string privpath="",
+        std::string capath="",
+        std::string crlpath="") :
     onError(std::move(onError)),
     onNewNode(std::move(onNewNode)),
     onReportedAddr(std::move(onReportedAddr)),
@@ -109,7 +115,21 @@ NetworkEngine::NetworkEngine(InfoHash& myid, NetworkConfig c,
     cache(rd),
     rate_limiter(config.max_req_per_sec),
     scheduler(scheduler)
-{}
+{
+    if(certpath.size()&&privpath.size())
+    {
+        configureDigitalCertificate(certpath, privpath);
+        if(isAuth_ && capath.size() && crlpath.size())
+        {
+            try {
+                ca_digital_certificate=std::unique_ptr<PKI::PKICertificate>(new PKI::PKICertificate(capath,crlpath,true));
+            } catch(...) {
+                ca_digital_certificate.release();
+            }
+        }
+    }
+
+}
 
 NetworkEngine::~NetworkEngine() {
     clear();
@@ -126,7 +146,7 @@ NetworkEngine::tellListener(const Sp<Node>& node, Tid socket_id, const InfoHash&
         if (version >= 1) {
             sendUpdateValues(node, hash, values, scheduler.time(), ntoken, socket_id);
         } else {
-            sendNodesValues(node->getAddr(), socket_id, nnodes.first, nnodes.second, values, query, ntoken);
+            sendNodesValues(node->getAddr(), socket_id, nnodes.first, nnodes.second, values, query, ntoken, 0);
         }
     } catch (const std::overflow_error& e) {
         if (logger_)
@@ -392,17 +412,33 @@ NetworkEngine::blacklistNode(const Sp<Node>& n)
     n->setExpired();
     blacklist.emplace(n->getAddr());
 }
+void
+NetworkEngine::revokeNode(const Sp<Node>& n)
+{
+    n->setExpired();
+    revoked.emplace(n->getAddr());
+}
 
 bool
 NetworkEngine::isNodeBlacklisted(const SockAddr& addr) const
 {
     return blacklist.find(addr) != blacklist.end();
 }
-
+bool
+NetworkEngine::isNodeRevoked(const SockAddr& addr) const
+{
+    return revoked.find(addr) != revoked.end();
+}
 void
 NetworkEngine::processMessage(const uint8_t *buf, size_t buflen, SockAddr f)
 {
     auto from = f.getMappedIPv4();
+    if (isNodeRevoked(from)) {
+        if (logger_)
+            logger_->w("Received packet from revoked node %s", from.toString().c_str());
+        return;
+    }
+
     if (isMartian(from)) {
         if (logger_)
             logger_->w("Received packet from martian node %s", from.toString().c_str());
@@ -510,17 +546,40 @@ NetworkEngine::processMessage(const uint8_t *buf, size_t buflen, SockAddr f)
 void
 NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& from)
 {
+    int reply_find_node=0;
     const auto& now = scheduler.time();
     auto node = cache.getNode(msg->id, from, now, true, msg->is_client);
-
+    std::string address;
+    if(isAuth_)
+    {
+        std::size_t found=std::string::npos;
+        if(node->getFamily()==AF_INET)
+        {
+            found = node->getAddrStr().find(':');
+        }
+        else
+        {
+            found = node->getAddrStr().find("]:");
+        }
+        if(found!=std::string::npos)
+        {
+            address=node->getAddrStr().substr(0, found);
+        }
+    }
     if (msg->type == MessageType::ValueUpdate) {
         auto rsocket = node->getSocket(msg->tid);
         if (not rsocket)
             throw DhtProtocolException {DhtProtocolException::UNKNOWN_TID, "Can't find socket", msg->id};
-        node->received(now, {});
-        onNewNode(node, 2);
-        deserializeNodes(*msg, from);
-        rsocket->on_receive(node, std::move(*msg));
+
+        try {
+            node->received(now, {});
+            onNewNode(node, 2);
+            deserializeNodes(*msg, from);
+            rsocket->on_receive(node, std::move(*msg));
+        } catch (DhtProtocolException &e) {
+            //WRONG_NODE_INFO_BUF_LEN
+            sendError(from, msg->tid, e.getCode(), e.getMsg().c_str(), true);
+        }
     }
     else if (msg->type == MessageType::Error or msg->type == MessageType::Reply) {
         auto rsocket = node->getSocket(msg->tid);
@@ -542,6 +601,75 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
                 return;
             }
         }
+        if(req && isAuth_ &&  msg->type == MessageType::Reply )
+        {
+            PKI::PKICertificate *other=nullptr;
+            try
+            {
+                if(node->getDigitalCertificate().size())
+                {
+                    other=new PKI::PKICertificate{node->getDigitalCertificate(),"",false};
+                }
+                else if(msg->certificate.size())
+                {
+                    other=new PKI::PKICertificate{msg->certificate,"",false};
+                }
+                if(!other || !other->VerifySubjectName(address)  ||
+                        (!ca_digital_certificate  || !ca_digital_certificate->VerifySignatureCert(other->SavePubKey(), false)))
+                {
+
+                    delete other;
+                    other=nullptr;
+                    revokeNode(node);
+                    return;
+                }
+                msg->certificate=other->SavePubKey();
+                if(req->getType()==MessageType::Ping )
+                {
+                    msg->verify_reply_ping();
+                }
+                if (req->getType()==MessageType::AnnounceValue )
+                {
+                    msg->verify_reply_announce_value();
+                }
+                else if(req->getType()==MessageType::Listen)
+                {
+                    msg->verify_reply_listen();
+                }
+                else if(req->getType()==MessageType::Refresh)
+                {
+                    msg->verify_reply_refresh();
+                }
+                else if(req->getType()==MessageType::FindNode)
+                {
+                    msg->verify_reply_find_node();
+                }
+                else
+                {
+                    msg->is_verified=true;
+                }
+                delete other;
+                other=nullptr;
+                if(!msg->is_verified)
+                {
+                    node->authError();
+                    return;
+                }
+                if(node->getDigitalCertificate().empty())
+                {
+                    node->setDigitalCertificate(msg->certificate);
+                }
+            }
+            catch(...)
+            {
+
+                delete other;
+                other=nullptr;
+                revokeNode(node);
+                return;
+            }
+        }
+
 
         node->received(now, req);
 
@@ -577,7 +705,7 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
         case MessageType::Reply:
             if (req) { /* request reply */
                 try {
-		    deserializeNodes(*msg, from);
+                    deserializeNodes(*msg, from);
                     auto& r = *req;
                     if (r.getType() == MessageType::AnnounceValue
                         or r.getType() == MessageType::Listen
@@ -586,15 +714,15 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
                     }
                     r.reply_time = scheduler.time();
                     r.setDone(std::move(*msg));
-		} catch (...) {
+                } catch (...) {
                     req->node->authError();
-		}    
+                }
                 break;
             } else { /* request socket data */
-		try {    
+                try {
                     deserializeNodes(*msg, from);
                     rsocket->on_receive(node, std::move(*msg));
-		} catch(DhtProtocolException &ex) {
+                } catch(DhtProtocolException &ex) {
                     node->authError();
                 }
             }
@@ -603,12 +731,76 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
             break;
         }
     } else {
+        reply_find_node=0;
+        if(isAuth_)
+        {
+
+            PKI::PKICertificate * other=nullptr;
+            try
+            {
+                if(msg->certificate.size())
+                {
+                    other=new PKI::PKICertificate{msg->certificate,"",false};
+                }
+                else if(node->getDigitalCertificate().size())
+                {
+                    other=new PKI::PKICertificate{node->getDigitalCertificate(),"",false};
+                }
+
+                if( (other && other->VerifySubjectName(address)) &&
+                        (ca_digital_certificate  &&  ca_digital_certificate->VerifySignatureCert(other->SavePubKey(), false)))
+                {
+                    //    !msg->is_verified
+                    msg->certificate=other->SavePubKey();
+                    delete other;
+                    other=nullptr;
+                }
+                else
+                {
+                    delete other;
+                    other=nullptr;
+                    revokeNode(node);
+                    return;
+                }
+
+            }
+            catch(...)
+            {
+                delete other;
+                other=nullptr;
+                node->authError();
+                return;
+            }
+        }
         node->received(now, {});
         if (not node->isClient())
             onNewNode(node, 1);
         try {
             switch (msg->type) {
             case MessageType::Ping:
+                if(isAuth_ )
+                {
+                    try {
+                        if(digital_certificate->VerifySubjectName(msg->address))
+                        {
+                            msg->verify_ping();
+                        }
+                        if(msg->is_verified)
+                        {
+                            node->setDigitalCertificate(msg->certificate);
+                        }
+                        else
+                        {
+                            std::cout << address <<" ping nao autenticado em req\n";
+
+                            node->authError();
+                            return;
+                        }
+                    } catch(...) {
+                        node->authError();
+                        return;
+                    }
+                }
                 ++in_stats.ping;
                 if (logIncoming_)
                     if (logger_)
@@ -617,12 +809,35 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
                 sendPong(from, msg->tid);
                 break;
             case MessageType::FindNode: {
+                if(isAuth_ )
+                {
+                    reply_find_node=1;
+                    try {
+                        msg->verify_find_node();
+                    } catch(...) {
+                        node->authError();
+                        return;
+                    }
+                    if(!msg->is_verified)
+                    {
+                        node->authError();
+                        return;
+                    }
+                    else
+                    {
+                        if(node->getDigitalCertificate().empty())
+                        {
+                            node->setDigitalCertificate(msg->certificate);
+                            reply_find_node++;
+                        }
+                    }
+                }
                 // if (logger_)
                 //     logger_->d(msg->target, node->id, "[node %s] got 'find' request for %s (%d)", node->toString().c_str(), msg->target.toString().c_str(), msg->want);
                 ++in_stats.find;
                 RequestAnswer answer = onFindNode(node, msg->target, msg->want);
                 auto nnodes = bufferNodes(from.getFamily(), msg->target, msg->want, answer.nodes4, answer.nodes6);
-                sendNodesValues(from, msg->tid, nnodes.first, nnodes.second, {}, {}, answer.ntoken);
+                sendNodesValues(from, msg->tid, nnodes.first, nnodes.second, {}, {}, answer.ntoken, reply_find_node);
                 break;
             }
             case MessageType::GetValues: {
@@ -631,7 +846,7 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
                 ++in_stats.get;
                 RequestAnswer answer = onGetValues(node, msg->info_hash, msg->want, msg->query);
                 auto nnodes = bufferNodes(from.getFamily(), msg->info_hash, msg->want, answer.nodes4, answer.nodes6);
-                sendNodesValues(from, msg->tid, nnodes.first, nnodes.second, answer.values, msg->query, answer.ntoken);
+                sendNodesValues(from, msg->tid, nnodes.first, nnodes.second, answer.values, msg->query, answer.ntoken, 0);
                 break;
             }
             case MessageType::AnnounceValue: {
@@ -651,6 +866,21 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
             case MessageType::Refresh:
                 if (logIncoming_ and logger_)
                     logger_->d(msg->info_hash, node->id, "[node %s] got 'refresh' request for %s", node->toString().c_str(), msg->info_hash.toString().c_str());
+                if(isAuth_ )
+                {
+                    try {
+                        msg->verify_refresh();
+                    } catch(...) {
+                        node->authError();
+                        return;
+                    }
+                    if(!msg->is_verified)
+                    {
+                        node->authError();
+                        return;
+                    }
+                }
+
                 onRefresh(node, msg->info_hash, msg->token, msg->value_id);
                 /* Same note as above in MessageType::AnnounceValue applies. */
                 sendValueAnnounced(from, msg->tid, msg->value_id);
@@ -658,6 +888,23 @@ NetworkEngine::process(std::unique_ptr<ParsedMessage>&& msg, const SockAddr& fro
             case MessageType::Listen: {
                 if (logIncoming_ and logger_)
                     logger_->d(msg->info_hash, node->id, "[node %s] got 'listen' request for %s", node->toString().c_str(), msg->info_hash.toString().c_str());
+                if(isAuth_ )
+                {
+                    try {
+                        msg->verify_listen();
+                    } catch(...) {
+                        node->authError();
+                        return;
+                    }
+                    if(msg->is_verified)
+                    {
+                        node->setDigitalCertificate(msg->certificate);
+                    }
+                    else {
+                        node->authError();
+                        return;
+                    }
+                }
                 ++in_stats.listen;
                 RequestAnswer answer = onListen(node, msg->info_hash, msg->token, msg->socket_id, std::move(msg->query), msg->version);
                 auto nnodes = bufferNodes(from.getFamily(), msg->info_hash, msg->want, answer.nodes4, answer.nodes6);
@@ -707,11 +954,24 @@ NetworkEngine::send(const SockAddr& addr, const char *buf, size_t len, bool conf
 
 Sp<Request>
 NetworkEngine::sendPing(const Sp<Node>& node, RequestCb&& on_done, RequestExpiredCb&& on_expired) {
+    std::string address;
+    std::size_t found=std::string::npos;
+    if(node->getFamily()==AF_INET)
+    {
+        found = node->getAddrStr().find(':');
+    }
+    else
+    {
+        found = node->getAddrStr().find("]:");
+    }
+    if(found!=std::string::npos)
+    {
+        address=node->getAddrStr().substr(0, found);
+    }
     Tid tid (node->getNewTid());
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(5+(config.network?1:0));
-
+    pk.pack_map(5+(config.network?1:0)+(isAuth_?3:0));
     pk.pack(KEY_A); pk.pack_map(1);
      pk.pack(KEY_REQ_ID); pk.pack(myid);
 
@@ -722,6 +982,23 @@ NetworkEngine::sendPing(const Sp<Node>& node, RequestCb&& on_done, RequestExpire
     if (config.network) {
         pk.pack(KEY_NETID); pk.pack(config.network);
     }
+    if(isAuth_ && digital_certificate!=nullptr)
+    {
+        try
+        {
+            pk.pack(KEY_ADDR); pk.pack(address);
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+            auto sign = digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_CERT);    pk.pack(digital_certificate->SavePubKey());
+            pk.pack(KEY_AUTH); pk.pack(sign);
+        }
+        catch(...)
+        {
+            return nullptr;
+        }
+    }
+
 
     auto req = std::make_shared<Request>(MessageType::Ping, tid, node,
         Blob(buffer.data(), buffer.data() + buffer.size()),
@@ -747,8 +1024,7 @@ void
 NetworkEngine::sendPong(const SockAddr& addr, Tid tid) {
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(4+(config.network?1:0));
-
+    pk.pack_map(4+(config.network?1:0)+(isAuth_?2:0));
     pk.pack(KEY_R); pk.pack_map(2);
       pk.pack(KEY_REQ_ID); pk.pack(myid);
       insertAddr(pk, addr);
@@ -758,6 +1034,22 @@ NetworkEngine::sendPong(const SockAddr& addr, Tid tid) {
     pk.pack(KEY_UA); pk.pack(my_v);
     if (config.network) {
         pk.pack(KEY_NETID); pk.pack(config.network);
+    }
+    if(isAuth_ && digital_certificate!=nullptr)
+    {
+        try
+        {
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+
+            auto sign=digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_AUTH); pk.pack(sign);
+            pk.pack(KEY_CERT);    pk.pack(digital_certificate->SavePubKey());
+        }
+        catch(...)
+        {
+            return;
+        }
     }
 
     send(addr, buffer.data(), buffer.size());
@@ -769,7 +1061,7 @@ NetworkEngine::sendFindNode(const Sp<Node>& n, const InfoHash& target, want_t wa
     Tid tid (n->getNewTid());
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(5+(config.network?1:0));
+    pk.pack_map(5+(config.network?1:0)+(isAuth_ ? (n->getDigitalCertificate().size()?1:2):0));
 
     pk.pack(KEY_A); pk.pack_map(2 + (want>0?1:0));
       pk.pack(KEY_REQ_ID);     pk.pack(myid);
@@ -788,7 +1080,22 @@ NetworkEngine::sendFindNode(const Sp<Node>& n, const InfoHash& target, want_t wa
     if (config.network) {
         pk.pack(KEY_NETID); pk.pack(config.network);
     }
+    if(isAuth_ && digital_certificate)
+    {
+        try {
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+            auto sign = digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_AUTH); pk.pack(sign);
+            if(n->getDigitalCertificate().empty())
+            {
+                pk.pack(KEY_CERT);pk.pack(digital_certificate->SavePubKey());
+            }
+        }
+        catch(...) {
 
+        }
+    }
     auto req = std::make_shared<Request>(MessageType::FindNode, tid, n,
         Blob(buffer.data(), buffer.data() + buffer.size()),
         [=](const Request& req_status, ParsedMessage&& msg) { /* on done */
@@ -895,7 +1202,7 @@ NetworkEngine::deserializeNodes(ParsedMessage& msg, const SockAddr& from) {
             addr = from;
             addr.setPort(port);
         }
-        if (isMartian(addr) || isNodeBlacklisted(addr))
+        if (isMartian(addr) || isNodeBlacklisted(addr) || isNodeRevoked(addr))
             continue;
         msg.nodes4.emplace_back(cache.getNode(ni_id, addr, now, false));
         onNewNode(msg.nodes4.back(), 0);
@@ -911,7 +1218,7 @@ NetworkEngine::deserializeNodes(ParsedMessage& msg, const SockAddr& from) {
             addr = from;
             addr.setPort(port);
         }
-        if (isMartian(addr) || isNodeBlacklisted(addr))
+        if (isMartian(addr) || isNodeBlacklisted(addr)|| isNodeRevoked(addr))
             continue;
         msg.nodes6.emplace_back(cache.getNode(ni_id, addr, now, false));
         onNewNode(msg.nodes6.back(), 0);
@@ -974,12 +1281,11 @@ NetworkEngine::sendValueParts(Tid tid, const std::vector<Blob>& svals, const Soc
 
 void
 NetworkEngine::sendNodesValues(const SockAddr& addr, Tid tid, const Blob& nodes, const Blob& nodes6,
-        const std::vector<Sp<Value>>& st, const Query& query, const Blob& token)
+        const std::vector<Sp<Value>>& st, const Query& query, const Blob& token, int reply_find_node=0)
 {
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(4+(config.network?1:0));
-
+    pk.pack_map(4+(config.network?1:0)+(isAuth_?reply_find_node:0 ));
     pk.pack(KEY_R);
     pk.pack_map(2 + (not st.empty()?1:0) + (nodes.size()>0?1:0) + (nodes6.size()>0?1:0) + (not token.empty()?1:0));
     pk.pack(KEY_REQ_ID); pk.pack(myid);
@@ -1020,7 +1326,22 @@ NetworkEngine::sendNodesValues(const SockAddr& addr, Tid tid, const Blob& nodes,
     if (config.network) {
         pk.pack(KEY_NETID); pk.pack(config.network);
     }
-
+    if(isAuth_ && reply_find_node)
+    {
+        try {
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+            auto sign = digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_AUTH); pk.pack(sign);
+            if(reply_find_node==2)
+            {
+                pk.pack(KEY_CERT); pk.pack(digital_certificate->SavePubKey());
+            }
+        }
+        catch(...) {
+            return;
+        }
+    }
     // send response
     send(addr, buffer.data(), buffer.size());
 
@@ -1091,7 +1412,7 @@ NetworkEngine::sendListen(const Sp<Node>& n,
     Tid tid (n->getNewTid());
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(5+(config.network?1:0));
+    pk.pack_map(5+(config.network?1:0)+(isAuth_?1:0));
 
     auto has_query = not query.where.empty() or not query.select.empty();
     pk.pack(KEY_A); pk.pack_map(5 + has_query);
@@ -1112,6 +1433,17 @@ NetworkEngine::sendListen(const Sp<Node>& n,
         pk.pack(KEY_NETID); pk.pack(config.network);
     }
 
+    if(isAuth_ && digital_certificate!=nullptr)
+    {
+        try {
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+            auto sign = digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_AUTH); pk.pack(sign);
+        }
+        catch(...) {
+        }
+    }
     auto req = std::make_shared<Request>(MessageType::Listen, tid, n,
         Blob(buffer.data(), buffer.data() + buffer.size()),
         [=](const Request& req_status, ParsedMessage&& msg) { /* on done */
@@ -1132,7 +1464,7 @@ void
 NetworkEngine::sendListenConfirmation(const SockAddr& addr, Tid tid) {
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(4+(config.network?1:0));
+    pk.pack_map(4+(config.network?1:0)+(isAuth_?1:0));
 
     pk.pack(KEY_R); pk.pack_map(2);
       pk.pack(KEY_REQ_ID); pk.pack(myid);
@@ -1144,7 +1476,18 @@ NetworkEngine::sendListenConfirmation(const SockAddr& addr, Tid tid) {
     if (config.network) {
         pk.pack(KEY_NETID); pk.pack(config.network);
     }
+    if(isAuth_ && digital_certificate)
+    {
+        try {
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+            auto sign = digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_AUTH); pk.pack(sign);
+        }
+        catch(...) {
 
+        }
+    }
     send(addr, buffer.data(), buffer.size());
 }
 
@@ -1264,7 +1607,7 @@ NetworkEngine::sendRefreshValue(const Sp<Node>& n,
     Tid tid (n->getNewTid());
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(5+(config.network?1:0));
+    pk.pack_map(5+(config.network?1:0)+(isAuth_?1:0));
 
     pk.pack(KEY_A); pk.pack_map(4);
       pk.pack(KEY_REQ_ID);       pk.pack(myid);
@@ -1279,7 +1622,18 @@ NetworkEngine::sendRefreshValue(const Sp<Node>& n,
     if (config.network) {
         pk.pack(KEY_NETID); pk.pack(config.network);
     }
+    if(isAuth_ && digital_certificate)
+    {
+        try {
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+            auto sign = digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_AUTH); pk.pack(sign);
+        }
+        catch(...) {
 
+        }
+    }
     auto req = std::make_shared<Request>(MessageType::Refresh, tid, n,
         Blob(buffer.data(), buffer.data() + buffer.size()),
         [=](const Request& req_status, ParsedMessage&& msg) { /* on done */
@@ -1310,7 +1664,7 @@ void
 NetworkEngine::sendValueAnnounced(const SockAddr& addr, Tid tid, Value::Id vid) {
     msgpack::sbuffer buffer;
     msgpack::packer<msgpack::sbuffer> pk(&buffer);
-    pk.pack_map(4+(config.network?1:0));
+    pk.pack_map(4+(config.network?1:0)+isAuth_);
 
     pk.pack(KEY_R); pk.pack_map(3);
       pk.pack(KEY_REQ_ID);  pk.pack(myid);
@@ -1323,7 +1677,18 @@ NetworkEngine::sendValueAnnounced(const SockAddr& addr, Tid tid, Value::Id vid) 
     if (config.network) {
         pk.pack(KEY_NETID); pk.pack(config.network);
     }
+    if(isAuth_ && digital_certificate)
+    {
+        try {
+            PKI::Converter::Base64 encoder;
+            std::string aux{buffer.data(),buffer.size()};
+            auto sign = digital_certificate->SignMessage(encoder.Encoder(aux));
+            pk.pack(KEY_AUTH); pk.pack(sign);
+        }
+        catch(...) {
 
+        }
+    }
     send(addr, buffer.data(), buffer.size());
 }
 

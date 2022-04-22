@@ -143,7 +143,17 @@ struct Node {
     }
 
     std::string toString() const;
-
+/*
+ *
+ */
+   void setDigitalCertificate(std::string digital_certificate)
+   {
+	   this->digital_certificate=digital_certificate;
+   }
+   std::string getDigitalCertificate()
+   {
+	   return digital_certificate;
+   }
     OPENDHT_PUBLIC friend std::ostream& operator<< (std::ostream& s, const Node& h);
 
     static constexpr const std::chrono::minutes NODE_GOOD_TIME {120};
@@ -157,7 +167,7 @@ struct Node {
 private:
     /* Number of times we accept authentication errors from this node. */
     static const constexpr unsigned MAX_AUTH_ERRORS {3};
-
+    std::string digital_certificate{};
     SockAddr addr;
     bool is_client {false};
     time_point time {time_point::min()};            /* last time eared about */

@@ -36,6 +36,7 @@
 #include <exception>
 #include <queue>
 #include <chrono>
+#include <fstream>
 
 namespace dht {
 
@@ -396,6 +397,23 @@ public:
         run(port, config);
     }
     void run(in_port_t port, Config& config, Context&& context = {});
+    void run(std::string certpath="", std::string privpath="", std::string capath="", std::string crlpath="", in_port_t port = dht::net::DHT_DEFAULT_PORT,
+            const crypto::Identity& identity = {}, bool threaded = true, NetId network = 0)
+    {
+        Config config;
+        config.dht_config.node_config.network = network;
+        config.dht_config.id = identity;
+        config.threaded = threaded;
+        config.dht_config.node_config.prvpath=privpath;
+        config.dht_config.node_config.certpath=certpath;
+        config.dht_config.node_config.capath=capath;
+        config.dht_config.node_config.crlpath=crlpath;
+        /*
+         * @TODO: I don't use privpath and certpath to Identity because it supports RSA just only
+         */
+
+        run(port, config);
+    }
 
     /**
      * Same as @run(sockaddr_in, sockaddr_in6, Identity, bool, StatusCallback), but with string IP addresses and service (port).
@@ -530,6 +548,14 @@ private:
      * would create instances of classes using a common logger.
      */
     std::shared_ptr<dht::Logger> logger_;
+
+    dht::Blob Load(std::string name)
+    {
+        std::ifstream is{name.data()};
+        std::vector<uint8_t> contents((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+        is.close();
+        return contents;
+    }
 };
 
 }

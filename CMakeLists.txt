@@ -146,7 +146,7 @@ else ()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${DISABLE_MSC_WARNINGS}")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
 endif ()
-set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DMSGPACK_NO_BOOST -DMSGPACK_DISABLE_LEGACY_NIL -DMSGPACK_DISABLE_LEGACY_CONVERT")
+set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DMSGPACK_NO_BOOST -DMSGPACK_DISABLE_LEGACY_NIL -DMSGPACK_DISABLE_LEGACY_CONVERT -L/usr/local/lib")
 
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -323,7 +323,7 @@ if (OPENDHT_STATIC)
             PRIVATE  ${argon2_LIBRARIES}
             PUBLIC ${CMAKE_THREAD_LIBS_INIT} ${GNUTLS_LIBRARIES} ${Nettle_STATIC_LIBRARIES}
                    ${Jsoncpp_STATIC_LIBRARIES} ${FMT_LIBRARY} ${HTTP_PARSER_LIBRARY}
-                   ${OPENSSL_STATIC_LIBRARIES})
+		   ${OPENSSL_STATIC_LIBRARIES} PKIpp ssl crypto cryptopp)
     else ()
         if (OPENDHT_TOOLS)
             function (add_obj_lib name libfile)
@@ -389,14 +389,14 @@ if (OPENDHT_SHARED)
             PUBLIC ${CMAKE_THREAD_LIBS_INIT} ${OPENSSL_LIBRARIES}
             PRIVATE ${GNUTLS_LIBRARIES} ${Nettle_LIBRARIES}
                     ${Jsoncpp_LIBRARIES}
-                    ${FMT_LIBRARY} ${HTTP_PARSER_LIBRARY} ${argon2_LIBRARIES}
+                    ${FMT_LIBRARY} ${HTTP_PARSER_LIBRARY} ${argon2_LIBRARIES} PKIpp ssl crypto cryptopp
             SYSTEM "-framework CoreFoundation" "-framework Security")
     else ()
         target_link_libraries(opendht
             PUBLIC ${CMAKE_THREAD_LIBS_INIT} ${OPENSSL_LIBRARIES}
             PRIVATE ${GNUTLS_LIBRARIES} ${Nettle_LIBRARIES}
                     ${Jsoncpp_LIBRARIES}
-                    ${FMT_LIBRARY} ${HTTP_PARSER_LIBRARY} ${argon2_LIBRARIES})
+                    ${FMT_LIBRARY} ${HTTP_PARSER_LIBRARY} ${argon2_LIBRARIES} PKIpp ssl crypto cryptopp)
     endif ()
 
     install (TARGETS opendht DESTINATION ${CMAKE_INSTALL_LIBDIR} EXPORT opendht)

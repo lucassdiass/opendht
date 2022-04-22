@@ -344,6 +344,8 @@ DhtRunner::bindOpDoneCallback(DoneCallbackSimple&& cb) {
 
 bool
 DhtRunner::checkShutdown() {
+    if (running != State::Stopping or ongoing_ops)
+        return false;
     decltype(shutdownCallbacks_) cbs;
     {
         std::lock_guard<std::mutex> lck(storage_mtx);

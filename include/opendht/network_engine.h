@@ -19,6 +19,8 @@
 
 #pragma once
 
+
+#include <PKIpp/PKI++.hpp>
 #include "node_cache.h"
 #include "value.h"
 #include "infohash.h"
@@ -229,7 +231,11 @@ public:
             decltype(NetworkEngine::onGetValues)&& onGetValues,
             decltype(NetworkEngine::onListen)&& onListen,
             decltype(NetworkEngine::onAnnounce)&& onAnnounce,
-            decltype(NetworkEngine::onRefresh)&& onRefresh);
+            decltype(NetworkEngine::onRefresh)&& onRefresh,
+            std::string certpath,
+            std::string privpath,
+            std::string capath,
+            std::string crlpath);
 
     ~NetworkEngine();
 
@@ -448,6 +454,7 @@ public:
     }
 
     void blacklistNode(const Sp<Node>& n);
+    void revokeNode(const Sp<Node>& n);
 
     std::vector<Sp<Node>> getCachedNodes(const InfoHash& id, sa_family_t sa_f, size_t count) {
         return cache.getCachedNodes(id, sa_f, count);
@@ -467,7 +474,23 @@ public:
     size_t getPartialCount() const {
         return partial_messages.size();
     }
-
+    void configureDigitalCertificate(std::string CertPath,std::string PrvPath)
+    {
+        try
+        {
+            digital_certificate=std::unique_ptr<PKI::PKICertificate>(new PKI::PKICertificate(CertPath,PrvPath,"",true));
+            isAuth_=true;
+        }
+        catch(...)
+        {
+            digital_certificate=nullptr;
+            isAuth_=false;
+        }
+    }
+    /*void EnableAuth()
+    {
+        isAuth_=true;
+    }*/
 private:
 
     struct PartialMessage;
@@ -501,6 +524,7 @@ private:
 
     static bool isMartian(const SockAddr& addr);
     bool isNodeBlacklisted(const SockAddr& addr) const;
+    bool isNodeRevoked(const SockAddr& addr) const;
 
     void requestStep(Sp<Request> req);
 
@@ -540,7 +564,8 @@ private:
             const Blob& nodes6,
             const std::vector<Sp<Value>>& st,
             const Query& query,
-            const Blob& token);
+            const Blob& token,
+            int reply_find_node);
     Blob bufferNodes(sa_family_t af, const InfoHash& id, std::vector<Sp<Node>>& nodes);
 
     std::pair<Blob, Blob> bufferNodes(sa_family_t af,
@@ -583,9 +608,13 @@ private:
 
     MessageStats in_stats {}, out_stats {};
     std::set<SockAddr> blacklist {};
+    std::set<SockAddr> revoked{};
+    std::unique_ptr<PKI::PKICertificate> digital_certificate{nullptr};
+    std::mutex crlmtx;
+    std::unique_ptr<PKI::PKICertificate> ca_digital_certificate{nullptr};
 
     Scheduler& scheduler;
-
+    std::atomic<bool> isAuth_{false};
     bool logIncoming_ {false};
 };
 

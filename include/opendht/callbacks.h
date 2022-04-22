@@ -140,6 +140,11 @@ struct OPENDHT_PUBLIC Config {
      *   - Larger listen refresh time
      */
     bool public_stable {false};
+    std::string certpath{};
+    std::string prvpath{};
+    std::string crlpath{};
+    std::string capath{};
+
 };
 
 /**
