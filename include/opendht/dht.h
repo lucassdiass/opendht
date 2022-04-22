@@ -302,6 +302,9 @@ public:
     void setStorageLimit(size_t limit = DEFAULT_STORAGE_LIMIT) override {
         max_store_size = limit;
     }
+    size_t getStorageLimit() const override {
+        return max_store_size;
+    }
 
     /**
      * Returns the total memory usage of stored values and the number
@@ -447,13 +450,13 @@ private:
     // Storage
     void storageAddListener(const InfoHash& id, const Sp<Node>& node, size_t tid, Query&& = {}, int version = 0);
     bool storageStore(const InfoHash& id, const Sp<Value>& value, time_point created, const SockAddr& sa = {}, bool permanent = false);
-    bool storageErase(const InfoHash& id, Value::Id vid);
     bool storageRefresh(const InfoHash& id, Value::Id vid);
     void expireStore();
     void expireStorage(InfoHash h);
     void expireStore(decltype(store)::iterator);
 
-    void storageChanged(const InfoHash& id, Storage& st, ValueStorage&, bool newValue);
+    void storageRemoved(const InfoHash& id, Storage& st, const std::vector<Sp<Value>>& values, size_t totalSize);
+    void storageChanged(const InfoHash& id, Storage& st, const Sp<Value>&, bool newValue);
     std::string printStorageLog(const decltype(store)::value_type&) const;
 
     /**

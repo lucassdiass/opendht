@@ -1194,15 +1194,20 @@ Dht::cancelPut(const InfoHash& id, const Value::Id& vid)
     };
     canceled |= sr_cancel_put(dht4.searches);
     canceled |= sr_cancel_put(dht6.searches);
-    if (canceled)
-        storageErase(id, vid);
+    if (canceled) {
+        auto st = store.find(id);
+        if (st != store.end()) {
+            if (auto value = st->second.remove(id, vid))
+                storageRemoved(id, st->second, {value}, value->size());
+        }
+    }
     return canceled;
 }
 
 // Storage
 
 void
-Dht::storageChanged(const InfoHash& id, Storage& st, ValueStorage& v, bool newValue)
+Dht::storageChanged(const InfoHash& id, Storage& st, const Sp<Value>& v, bool newValue)
 {
     if (newValue) {
         if (not st.local_listeners.empty()) {
@@ -1212,8 +1217,8 @@ Dht::storageChanged(const InfoHash& id, Storage& st, ValueStorage& v, bool newVa
             cbs.reserve(st.local_listeners.size());
             for (const auto& l : st.local_listeners) {
                 std::vector<Sp<Value>> vals;
-                if (not l.second.filter or l.second.filter(*v.data))
-                    vals.push_back(v.data);
+                if (not l.second.filter or l.second.filter(*v))
+                    vals.push_back(v);
                 if (not vals.empty()) {
                     if (logger_)
                         logger_->d(id, "[store %s] sending update local listener with token %lu",
@@ -1234,14 +1239,14 @@ Dht::storageChanged(const InfoHash& id, Storage& st, ValueStorage& v, bool newVa
         for (const auto& node_listeners : st.listeners) {
             for (const auto& l : node_listeners.second) {
                 auto f = l.second.query.where.getFilter();
-                if (f and not f(*v.data))
+                if (f and not f(*v))
                     continue;
                 if (logger_)
                     logger_->w(id, node_listeners.first->id, "[store %s] [node %s] sending update",
                         id.toString().c_str(),
                         node_listeners.first->toString().c_str());
                 std::vector<Sp<Value>> vals {};
-                vals.push_back(v.data);
+                vals.push_back(v);
                 Blob ntoken = makeToken(node_listeners.first->getAddr(), false);
                 network_engine.tellListener(node_listeners.first, l.first, id, 0, ntoken, {}, {},
                         std::move(vals), l.second.query, l.second.version);
@@ -1282,24 +1287,16 @@ Dht::storageStore(const InfoHash& id, const Sp<Value>& value, time_point created
             vs->expiration_job = scheduler.add(expiration, std::bind(&Dht::expireStorage, this, id));
         }
         if (total_store_size > max_store_size) {
+            auto value = vs->data;
+            auto value_diff = store.second.values_diff;
             expireStore();
+            storageChanged(id, st->second, value, value_diff > 0);
+        } else {
+            storageChanged(id, st->second, vs->data, store.second.values_diff > 0);
         }
-        storageChanged(id, st->second, *vs, store.second.values_diff > 0);
     }
 
     return std::get<0>(store);
-}
-
-bool
-Dht::storageErase(const InfoHash& id, Value::Id vid)
-{
-    auto st = store.find(id);
-    if (st == store.end())
-        return false;
-    auto ret = st->second.remove(id, vid);
-    total_store_size += ret.size_diff;
-    total_values += ret.values_diff;
-    return ret.values_diff;
 }
 
 void
@@ -1333,36 +1330,8 @@ Dht::expireStore(decltype(store)::iterator i)
     const auto& id = i->first;
     auto& st = i->second;
     auto stats = st.expire(id, scheduler.time());
-    total_store_size += stats.first;
-    total_values -= stats.second.size();
     if (not stats.second.empty()) {
-        if (logger_)
-            logger_->d(id, "[store %s] discarded %ld expired values (%ld bytes)",
-            id.toString().c_str(), stats.second.size(), -stats.first);
-
-        if (not st.listeners.empty()) {
-            if (logger_)
-                logger_->d(id, "[store %s] %lu remote listeners", id.toString().c_str(), st.listeners.size());
-
-            std::vector<Value::Id> ids;
-            ids.reserve(stats.second.size());
-            for (const auto& v : stats.second)
-                ids.emplace_back(v->id);
-
-            for (const auto& node_listeners : st.listeners) {
-                for (const auto& l : node_listeners.second) {
-                    if (logger_)
-                        logger_->w(id, node_listeners.first->id, "[store %s] [node %s] sending expired",
-                            id.toString().c_str(),
-                            node_listeners.first->toString().c_str());
-                    Blob ntoken = makeToken(node_listeners.first->getAddr(), false);
-                    network_engine.tellListenerExpired(node_listeners.first, l.first, id, ntoken, ids, l.second.version);
-                }
-            }
-        }
-        for (const auto& local_listeners : st.local_listeners) {
-            local_listeners.second.get_cb(stats.second, true);
-        }
+        storageRemoved(id, st, stats.second, -stats.first);
     }
 }
 
@@ -1372,6 +1341,41 @@ Dht::expireStorage(InfoHash h)
     auto i = store.find(h);
     if (i != store.end())
         expireStore(i);
+}
+
+void
+Dht::storageRemoved(const InfoHash& id, Storage& st, const std::vector<Sp<Value>>& values, size_t totalSize)
+{
+    if (logger_)
+        logger_->d(id, "[store %s] discarded %ld values (%ld bytes)",
+        id.toString().c_str(), values.size(), totalSize);
+
+    total_store_size -= totalSize;
+    total_values -= values.size();
+
+    if (not st.listeners.empty()) {
+        if (logger_)
+            logger_->d(id, "[store %s] %lu remote listeners", id.toString().c_str(), st.listeners.size());
+
+        std::vector<Value::Id> ids;
+        ids.reserve(values.size());
+        for (const auto& v : values)
+            ids.emplace_back(v->id);
+
+        for (const auto& node_listeners : st.listeners) {
+            for (const auto& l : node_listeners.second) {
+                if (logger_)
+                    logger_->w(id, node_listeners.first->id, "[store %s] [node %s] sending expired",
+                        id.toString().c_str(),
+                        node_listeners.first->toString().c_str());
+                Blob ntoken = makeToken(node_listeners.first->getAddr(), false);
+                network_engine.tellListenerExpired(node_listeners.first, l.first, id, ntoken, ids, l.second.version);
+            }
+        }
+    }
+    for (const auto& local_listeners : st.local_listeners) {
+        local_listeners.second.get_cb(values, true);
+    }
 }
 
 void
@@ -1399,23 +1403,23 @@ Dht::expireStore()
             break;
         }
         auto largest = store_quota.begin();
-        for (auto it = ++largest; it != store_quota.end(); ++it) {
+        for (auto it = std::next(largest); it != store_quota.end(); ++it) {
             if (it->second.size() > largest->second.size())
                 largest = it;
         }
-        if (logger_)
-            logger_->w("No space left: discarding value of largest consumer %s", largest->first.toString().c_str());
-        while (true) {
-            auto exp_value = largest->second.getOldest();
-            auto storage = store.find(exp_value.first);
-            if (storage != store.end()) {
-                auto ret = storage->second.remove(exp_value.first, exp_value.second);
-                total_store_size += ret.size_diff;
-                total_values += ret.values_diff;
-                if (logger_)
-                    logger_->w("Discarded %ld bytes, still %ld used", largest->first.toString().c_str(), total_store_size);
-                if (ret.values_diff)
-                    break;
+        if (largest != store_quota.end()) {
+            while (true) {
+                auto exp_value = largest->second.getOldest();
+                auto storage = store.find(exp_value.first);
+                if (storage != store.end()) {
+                    if (logger_)
+                        logger_->w("Storage quota full: discarding value from %s at %s %016" PRIx64, largest->first.toString().c_str(), exp_value.first.to_c_str(), exp_value.second);
+
+                    if (auto value = storage->second.remove(exp_value.first, exp_value.second)) {
+                        storageRemoved(storage->first, storage->second, {value}, value->size());
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1664,7 +1668,7 @@ Dht::dumpTables() const
 std::string
 Dht::getStorageLog() const
 {
-    std::stringstream out;
+    std::ostringstream out;
     for (const auto& s : store)
         out << printStorageLog(s);
     out << std::endl << std::endl;
@@ -2558,7 +2562,7 @@ Dht::storageRefresh(const InfoHash& id, Value::Id vid)
             }
         }
 
-        auto expiration = s->second.refresh(now, vid, types);
+        auto expiration = s->second.refresh(id, now, vid, types);
         if (expiration.first) {
             scheduler.cancel(expiration.first->expiration_job);
             if (expiration.second != time_point::max()) {

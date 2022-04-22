@@ -19,7 +19,7 @@ include(FindPkgConfig)
 include(cmake/CheckAtomic.cmake)
 
 set (opendht_VERSION_MAJOR 2)
-set (opendht_VERSION_MINOR 4.0)
+set (opendht_VERSION_MINOR 4.2)
 set (opendht_VERSION ${opendht_VERSION_MAJOR}.${opendht_VERSION_MINOR})
 set (PACKAGE_VERSION ${opendht_VERSION})
 set (VERSION "${opendht_VERSION}")
@@ -49,6 +49,10 @@ find_package(Doxygen)
 option (OPENDHT_DOCUMENTATION "Create and install the HTML based API documentation (requires Doxygen)" ${DOXYGEN_FOUND})
 
 # Dependencies
+if (NOT HAVE_CXX_ATOMICS_WITHOUT_LIB)
+    link_libraries (atomic)
+endif ()
+
 list (APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 if (NOT MSVC)
     set (THREADS_PREFER_PTHREAD_FLAG TRUE)
@@ -399,15 +403,23 @@ if (OPENDHT_SHARED)
 endif ()
 
 if (OPENDHT_C)
-    add_library (opendht-c SHARED
-        c/opendht.cpp
-        c/opendht_c.h
-    )
-    target_compile_definitions(opendht-c PRIVATE OPENDHT_C_BUILD)
     if (OPENDHT_SHARED)
-        target_link_libraries(opendht-c opendht)
-    else ()
-        target_link_libraries(opendht-c opendht-static)
+        add_library (opendht-c SHARED
+            c/opendht.cpp
+            c/opendht_c.h
+        )
+        target_compile_definitions(opendht-c PRIVATE OPENDHT_C_BUILD)
+        target_link_libraries(opendht-c PRIVATE opendht)
+        install (TARGETS opendht-c DESTINATION ${CMAKE_INSTALL_LIBDIR} EXPORT opendht-c)
+    endif ()
+
+    if (OPENDHT_STATIC)
+        add_library (opendht-c-static STATIC
+            c/opendht.cpp
+            c/opendht_c.h
+        )
+        target_link_libraries(opendht-c-static PRIVATE opendht-static)
+        install (TARGETS opendht-c-static DESTINATION ${CMAKE_INSTALL_LIBDIR} EXPORT opendht-c-static)
     endif ()
 
     # PkgConfig module
@@ -416,7 +428,6 @@ if (OPENDHT_C)
         opendht-c.pc
         @ONLY
     )
-    install (TARGETS opendht-c DESTINATION ${CMAKE_INSTALL_LIBDIR} EXPORT opendht-c)
     install (FILES ${CMAKE_CURRENT_BINARY_DIR}/opendht-c.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
     install (FILES c/opendht_c.h DESTINATION ${CMAKE_INSTALL_PREFIX}/include/opendht)
 endif ()

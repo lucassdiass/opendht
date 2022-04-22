@@ -37,18 +37,32 @@ public:
         storedValues_.emplace(expiration, std::pair<InfoHash, Value::Id>(id, value.id));
     }
     void erase(const InfoHash& id, const Value& value, time_point expiration) {
-        totalSize_ -= value.size();
         auto range = storedValues_.equal_range(expiration);
         for (auto rit = range.first; rit != range.second;) {
             if (rit->second.first == id && rit->second.second == value.id) {
+                totalSize_ -= value.size();
                 storedValues_.erase(rit);
-                break;
+                return;
             } else
                 ++rit;
         }
+        // printf("StorageBucket::erase can't find value %s %016" PRIx64 "\n", id.to_c_str(), value.id);
+    }
+    void refresh(const InfoHash& id, const Value& value, time_point old_expiration, time_point expiration) {
+        auto range = storedValues_.equal_range(old_expiration);
+        for (auto rit = range.first; rit != range.second;) {
+            if (rit->second.first == id && rit->second.second == value.id) {
+                storedValues_.erase(rit);
+                storedValues_.emplace(expiration, std::pair<InfoHash, Value::Id>(id, value.id));
+                return;
+            } else
+                ++rit;
+        }
+        // printf("StorageBucket::refresh can't find value %s %016" PRIx64 "\n", id.to_c_str(), value.id);
+        insert(id, value, expiration);
     }
     size_t size() const { return totalSize_; }
-    std::pair<InfoHash, Value::Id> getOldest() const { return storedValues_.begin()->second; }
+    std::pair<InfoHash, Value::Id> getOldest() const { return storedValues_.empty() ? std::pair<InfoHash, Value::Id>{} : storedValues_.begin()->second; }
 private:
     std::multimap<time_point, std::pair<InfoHash, Value::Id>> storedValues_;
     size_t totalSize_ {0};
@@ -74,7 +88,7 @@ struct Storage {
     size_t listener_token {1};
 
     /* The maximum number of values we store for a given hash. */
-    static constexpr unsigned MAX_VALUES {1024};
+    static constexpr unsigned MAX_VALUES {64 * 1024};
 
     /**
      * Changes caused by an operation on the storage.
@@ -144,11 +158,14 @@ struct Storage {
      * @return time of the next expiration, time_point::max() if no expiration
      */
     std::pair<ValueStorage*, time_point>
-    refresh(const time_point& now, const Value::Id& vid, const TypeStore& types) {
+    refresh(const InfoHash& id, const time_point& now, const Value::Id& vid, const TypeStore& types) {
         for (auto& vs : values)
             if (vs.data->id == vid) {
                 vs.created = now;
-                vs.expiration = std::max(vs.expiration, now + types.getType(vs.data->type).expiration);
+                auto oldExp = vs.expiration;
+                vs.expiration = std::max(oldExp, now + types.getType(vs.data->type).expiration);
+                if (vs.store_bucket)
+                    vs.store_bucket->refresh(id, *vs.data, oldExp, vs.expiration);
                 return {&vs, vs.expiration};
             }
         return {nullptr, time_point::max()};
@@ -160,7 +177,7 @@ struct Storage {
         local_listeners.erase(token);
     }
 
-    StoreDiff remove(const InfoHash& id, Value::Id);
+    Sp<Value> remove(const InfoHash& id, Value::Id);
 
     std::pair<ssize_t, std::vector<Sp<Value>>> expire(const InfoHash& id, time_point now);
 
@@ -229,7 +246,7 @@ Storage::store(const InfoHash& id, const Sp<Value>& value, time_point created, t
     return std::make_pair(nullptr, StoreDiff{});
 }
 
-Storage::StoreDiff
+Sp<Value>
 Storage::remove(const InfoHash& id, Value::Id vid)
 {
     auto it = std::find_if (values.begin(), values.end(), [&](const ValueStorage& vr) {
@@ -243,8 +260,9 @@ Storage::remove(const InfoHash& id, Value::Id vid)
     if (it->expiration_job)
         it->expiration_job->cancel();
     total_size -= size;
+    auto value = it->data;
     values.erase(it);
-    return {-size, -1, 0};
+    return value;
 }
 
 Storage::StoreDiff

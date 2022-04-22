@@ -1,7 +1,7 @@
 dnl define macros
 m4_define([opendht_major_version], 2)
 m4_define([opendht_minor_version], 4)
-m4_define([opendht_patch_version], 0)
+m4_define([opendht_patch_version], 2)
 m4_define([opendht_version],
 		  [opendht_major_version.opendht_minor_version.opendht_patch_version])
 
@@ -30,6 +30,13 @@ AS_IF([test "x$enable_logs" != "xno"], [
 	AC_DEFINE([OPENDHT_LOG], [true], [Define if DHT logs are enabled])
 ], [
 	AC_DEFINE([OPENDHT_LOG], [false], [Define if DHT logs are enabled])
+])
+
+dnl Check for C binding
+AC_ARG_ENABLE([c], [AS_HELP_STRING([--disable-c], [Disable DHT C binding])])
+AM_CONDITIONAL(ENABLE_C, test x$enable_c != "xno")
+AM_COND_IF(ENABLE_C, [
+	AC_DEFINE([OPENDHT_C], [], [Define if DHT C biding is enabled])
 ])
 
 dnl Check for indexation
@@ -198,6 +205,7 @@ AC_SUBST(PROJECT_BINARY_DIR, "../src/.libs")
 
 AC_CONFIG_FILES([Makefile
                  src/Makefile
+                 c/Makefile
                  tools/Makefile
                  python/Makefile
                  python/setup.py

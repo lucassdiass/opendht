@@ -163,14 +163,15 @@ DhtRunner::run(const Config& config, Context&& context)
             net::PacketList ret;
             {
                 std::lock_guard<std::mutex> lck(sock_mtx);
-                auto maxSize = net::RX_QUEUE_MAX_SIZE - pkts.size();
-                while (rcv.size() > maxSize) {
-                    if (logger_)
-                        logger_->e("Dropping packet: queue is full!");
-                    rcv.pop_front();
-                }
-
                 rcv.splice(rcv.end(), std::move(pkts));
+                size_t dropped = 0;
+                while (rcv.size() > net::RX_QUEUE_MAX_SIZE) {
+                    rcv.pop_front();
+                    dropped++;
+                }
+                if (dropped and logger_) {
+                    logger_->w("[runner %p] dropped %zu packets: queue is full!", this, dropped);
+                }
                 ret = std::move(rcv_free);
             }
             cv.notify_all();
@@ -297,16 +298,24 @@ DhtRunner::shutdown(ShutdownCallback cb, bool stop) {
     }
     if (logger_)
         logger_->d("[runner %p] state changed to Stopping, %zu ongoing ops", this, ongoing_ops.load());
+#ifdef OPENDHT_PROXY_CLIENT
+    ongoing_ops += 2;
+#else
     ongoing_ops++;
+#endif
     shutdownCallbacks_.emplace_back(std::move(cb));
     pending_ops.emplace([=](SecureDht&) mutable {
         auto onShutdown = [this]{ opEnded(); };
 #ifdef OPENDHT_PROXY_CLIENT
         if (dht_via_proxy_)
             dht_via_proxy_->shutdown(onShutdown, stop);
+        else
+            opEnded();
 #endif
         if (dht_)
             dht_->shutdown(onShutdown, stop);
+        else
+            opEnded();
     });
     cv.notify_all();
 }
@@ -563,6 +572,7 @@ DhtRunner::getNodeInfo(std::function<void(std::shared_ptr<NodeInfo>)> cb)
         info.node_id = dht.getNodeId();
         info.ipv4 = dht.getNodesStats(AF_INET);
         info.ipv6 = dht.getNodesStats(AF_INET6);
+        std::tie(info.storage_size, info.storage_values) = dht.getStoreSize();
         if (auto sock = dht.getSocket()) {
             info.bound4 = sock->getBoundRef(AF_INET).getPort();
             info.bound6 = sock->getBoundRef(AF_INET6).getPort();
@@ -817,19 +827,28 @@ void
 DhtRunner::cancelListen(InfoHash h, size_t token)
 {
     std::lock_guard<std::mutex> lck(storage_mtx);
+    if (running != State::Running)
+        return;
+    ongoing_ops++;
 #ifdef OPENDHT_PROXY_CLIENT
     pending_ops.emplace([=](SecureDht&) {
         auto it = listeners_.find(token);
-        if (it == listeners_.end()) return;
-        if (it->second.tokenClassicDht)
-            dht_->cancelListen(h, it->second.tokenClassicDht);
-        if (it->second.tokenProxyDht and dht_via_proxy_)
-            dht_via_proxy_->cancelListen(h, it->second.tokenProxyDht);
-        listeners_.erase(it);
+        if (it != listeners_.end()) {
+            if (it->second.tokenClassicDht)
+                dht_->cancelListen(h, it->second.tokenClassicDht);
+            if (it->second.tokenProxyDht and dht_via_proxy_)
+                dht_via_proxy_->cancelListen(h, it->second.tokenProxyDht);
+            listeners_.erase(it);
+        } else {
+            if (logger_)
+                logger_->w("[runner %p] cancelListen: unknown token %zu.", this, token);
+        }
+        opEnded();
     });
 #else
     pending_ops.emplace([=](SecureDht& dht) {
         dht.cancelListen(h, token);
+        opEnded();
     });
 #endif // OPENDHT_PROXY_CLIENT
     cv.notify_all();
@@ -839,19 +858,29 @@ void
 DhtRunner::cancelListen(InfoHash h, std::shared_future<size_t> ftoken)
 {
     std::lock_guard<std::mutex> lck(storage_mtx);
+    if (running != State::Running)
+        return;
+    ongoing_ops++;
 #ifdef OPENDHT_PROXY_CLIENT
-    pending_ops.emplace([=](SecureDht&) {
-        auto it = listeners_.find(ftoken.get());
-        if (it == listeners_.end()) return;
-        if (it->second.tokenClassicDht)
-            dht_->cancelListen(h, it->second.tokenClassicDht);
-        if (it->second.tokenProxyDht and dht_via_proxy_)
-            dht_via_proxy_->cancelListen(h, it->second.tokenProxyDht);
-        listeners_.erase(it);
+    pending_ops.emplace([this, h, ftoken = std::move(ftoken)](SecureDht&) {
+        auto token = ftoken.get();
+        auto it = listeners_.find(token);
+        if (it != listeners_.end()) {
+            if (it->second.tokenClassicDht)
+                dht_->cancelListen(h, it->second.tokenClassicDht);
+            if (it->second.tokenProxyDht and dht_via_proxy_)
+                dht_via_proxy_->cancelListen(h, it->second.tokenProxyDht);
+            listeners_.erase(it);
+        } else {
+            if (logger_)
+                logger_->w("[runner %p] cancelListen: unknown token %zu.", this, token);
+        }
+        opEnded();
     });
 #else
-    pending_ops.emplace([=](SecureDht& dht) {
+    pending_ops.emplace([this, h, ftoken = std::move(ftoken)](SecureDht& dht) {
         dht.cancelListen(h, ftoken.get());
+        opEnded();
     });
 #endif // OPENDHT_PROXY_CLIENT
     cv.notify_all();
@@ -886,7 +915,7 @@ DhtRunner::put(InfoHash hash, std::shared_ptr<Value> value, DoneCallback cb, tim
         return;
     }
     ongoing_ops++;
-    pending_ops.emplace([=, cb = std::move(cb)](SecureDht& dht) mutable {
+    pending_ops.emplace([=, value = std::move(value), cb = std::move(cb)](SecureDht& dht) mutable {
         dht.put(hash, value, bindOpDoneCallback(std::move(cb)), created, permanent);
     });
     cv.notify_all();
@@ -1066,7 +1095,7 @@ DhtRunner::bootstrap(std::vector<SockAddr> nodes, DoneCallbackSimple cb)
 }
 
 void
-DhtRunner::bootstrap(const SockAddr& addr, DoneCallbackSimple cb)
+DhtRunner::bootstrap(SockAddr addr, DoneCallbackSimple cb)
 {
     std::unique_lock<std::mutex> lck(storage_mtx);
     if (running != State::Running) {
@@ -1075,7 +1104,7 @@ DhtRunner::bootstrap(const SockAddr& addr, DoneCallbackSimple cb)
         return;
     }
     ongoing_ops++;
-    pending_ops_prio.emplace([addr, cb = bindOpDoneCallback(std::move(cb))](SecureDht& dht) mutable {
+    pending_ops_prio.emplace([addr = std::move(addr), cb = bindOpDoneCallback(std::move(cb))](SecureDht& dht) mutable {
         dht.pingNode(std::move(addr), std::move(cb));
     });
     cv.notify_all();
@@ -1094,12 +1123,12 @@ DhtRunner::bootstrap(const InfoHash& id, const SockAddr& address)
 }
 
 void
-DhtRunner::bootstrap(const std::vector<NodeExport>& nodes)
+DhtRunner::bootstrap(std::vector<NodeExport> nodes)
 {
     std::lock_guard<std::mutex> lck(storage_mtx);
     if (running != State::Running)
         return;
-    pending_ops_prio.emplace([=](SecureDht& dht) {
+    pending_ops_prio.emplace([nodes = std::move(nodes)](SecureDht& dht) {
         for (auto& node : nodes)
             dht.insertNode(node);
     });

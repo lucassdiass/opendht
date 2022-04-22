@@ -273,13 +273,13 @@ public:
      * Usefull to restart a node and get things running fast without putting load on the network.
      */
     void bootstrap(std::vector<SockAddr> nodes, DoneCallbackSimple cb={});
-    void bootstrap(const SockAddr& addr, DoneCallbackSimple cb={});
+    void bootstrap(SockAddr addr, DoneCallbackSimple cb={});
 
     /**
      * Insert known nodes to the routing table, without necessarly ping them.
      * Usefull to restart a node and get things running fast without putting load on the network.
      */
-    void bootstrap(const std::vector<NodeExport>& nodes);
+    void bootstrap(std::vector<NodeExport> nodes);
 
     /**
      * Add host:service to bootstrap nodes, and ping this node.
@@ -335,6 +335,7 @@ public:
 
     std::pair<size_t, size_t> getStoreSize() const;
 
+    void getStorageLimit() const;
     void setStorageLimit(size_t limit = DEFAULT_STORAGE_LIMIT);
 
     std::vector<NodeExport> exportNodes() const;

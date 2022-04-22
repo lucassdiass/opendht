@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-#include "def.h"
+#include <opendht/def.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -35,6 +35,8 @@ struct OPENDHT_C_PUBLIC dht_data_view {
     size_t size;
 };
 typedef struct dht_data_view dht_data_view;
+
+OPENDHT_C_PUBLIC const char* dht_version();
 
 // dht::Blob
 struct OPENDHT_C_PUBLIC dht_blob;
@@ -147,6 +149,7 @@ struct OPENDHT_PUBLIC dht_runner_config {
     bool peer_publish;
     dht_certificate* server_ca;
     dht_identity client_identity;
+    bool log;
 };
 typedef struct dht_runner_config dht_runner_config;
 OPENDHT_C_PUBLIC void dht_runner_config_default(dht_runner_config* config);
